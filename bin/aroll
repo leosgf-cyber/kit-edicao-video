@@ -1,0 +1,739 @@
+#!/usr/bin/env python3
+"""
+aroll — varre uma pasta (e subpastas) de video, separa o A-roll do B-roll
+e exporta cada take aparado: 1s antes da fala comecar, 1s depois de acabar
+(ou de dar erro).
+
+Como decide:
+  1. deteccao de voz (VAD Silero, dentro do whisper.cpp)
+       -> acha onde tem GENTE FALANDO. Nao confunde com barulho de fundo,
+          que e o que derruba deteccao por silencio em locacao com ambiente.
+  2. confianca da transcricao
+       -> trecho com confianca baixa e ruido que o modelo leu como fala
+          (o classico "Obrigado." em cima de barulho de cozinha). Cai fora.
+  3. cruzamento
+       -> gatilho ("rodou", "pode ir") abre take, pausa longa / proximo
+          gatilho / palavra de erro fecha.
+  Arquivo sem nenhuma fala confiavel = B-roll: pulado, so entra no relatorio.
+
+Uso:
+  aroll <pasta>                 processa e exporta
+  aroll <pasta> --seco          so analisa e imprime, nao corta nada
+  aroll <pasta> --aparar        um take por arquivo: so apara inicio e fim
+  aroll <pasta> --so-audio      nao olha a imagem (aceita fala fora de quadro)
+  aroll <pasta> --refaz         reprocessa arquivos que ja tem saida
+  aroll <pasta> --idioma en     muda o idioma da transcricao (padrao: pt)
+
+Nada e apagado nem movido. A saida vai pra subpasta _AROLL/ da pasta apontada.
+"""
+
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import unicodedata
+
+# ----------------------------------------------------------------------------
+# PARAMETROS — mexa aqui pra calibrar
+# ----------------------------------------------------------------------------
+
+MARGEM = 1.0            # segundos antes do inicio e depois do fim de cada take
+GAP_TAKE = 2.0          # pausa (s) que encerra um take; pausa menor nao encerra
+DURACAO_MINIMA = 5.0    # recorte mais curto que isso e descartado na hora.
+                        # Vale sobre o clipe EXPORTADO, ja com as duas margens
+                        # somadas — nao sobre a fala crua. 0 desliga a regra.
+PALAVRAS_NOME = 6       # quantas palavras da fala entram no nome do arquivo
+CONFIANCA_MINIMA = 0.50  # abaixo disso o modelo nao acredita no que ouviu (0 a 1)
+DENSIDADE_MINIMA = 3.0   # caracteres de fala por segundo de audio; abaixo disso
+                         # e alucinacao em cima de ruido (fala real da 10 a 25)
+
+# Talking head tem que ter gente EM QUADRO. Sem isso e direcao falando de fora
+# ("vai la", "pega o filao") com a camera no prato — nao e A-roll.
+LIMIAR_PESSOA = 0.25     # fracao do quadro ocupada pelo tronco da pessoa
+LIMIAR_ROSTO = 0.10      # ou, em plano fechado, a altura do rosto
+QUADROS_TESTE = 5        # quantos quadros do take sao olhados
+
+# Gatilhos e erros sao padroes de busca, nao palavras cravadas: a transcricao
+# erra a terminacao com frequencia ("rodou" vira "rodo"), entao o final e solto.
+# Escreva sempre em minusculo e sem acento. (a|b) = "a ou b", ? = opcional.
+
+GATILHOS = [
+    r"rod(a|o|ou|ando)",
+    r"pode(r)? (ir|falar|comecar|mandar)",
+    r"(ta|esta) gravando",
+    r"gravando",
+    r"acao",
+    r"valendo",
+    r"claquete",
+]
+
+# Frases que o whisper inventa em cima de ruido. Se o trecho inteiro for so
+# isso e nada mais, e alucinacao — nao e fala. Esvazie a lista pra desligar.
+ALUCINACOES = [
+    r"obrigad(o|a)",
+    r"e ai",
+    r"tchau",
+    r"legenda(s)? por.*",
+    r"inscreva[- ]se.*",
+    r"ate a proxima",
+    r"amara org",
+]
+
+ERROS = [
+    r"corta",
+    r"de novo",
+    r"pera(i| ai)?",
+    r"errei",
+    r"foi mal",
+    r"desculp(a|e)",
+    r"perdao",
+    r"repete",
+    r"nao lembro",
+    r"(ja )?pegou\?",
+    r"caralho", r"merda", r"porra", r"cacete", r"droga",
+]
+
+MODELOS = os.environ.get("KIT_VIDEO_MODELOS", os.path.expanduser("~/.kit-video/modelos"))
+MODELO_WHISPER = os.path.join(MODELOS, "ggml-large-v3-turbo.bin")
+MODELO_VAD = os.path.join(MODELOS, "ggml-silero-v5.1.2.bin")
+EXTENSOES = {".mp4", ".mov", ".m4v", ".mxf", ".avi", ".mkv", ".mts", ".m2ts", ".mpg", ".mpeg"}
+PASTA_SAIDA = "_AROLL"
+
+# ----------------------------------------------------------------------------
+# utilidades
+# ----------------------------------------------------------------------------
+
+
+def sem_acento(txt):
+    nfkd = unicodedata.normalize("NFKD", txt)
+    return "".join(c for c in nfkd if not unicodedata.combining(c))
+
+
+def normaliza(txt):
+    """minusculo, sem acento, so letras, numeros e interrogacao"""
+    t = sem_acento(txt).lower()
+    t = re.sub(r"[^a-z0-9? ]+", " ", t)
+    return re.sub(r"\s+", " ", t).strip()
+
+
+def slug(txt, limite=60):
+    t = re.sub(r"[^a-z0-9 ]+", " ", sem_acento(txt).lower())
+    t = re.sub(r"\s+", "-", t.strip())
+    return t[:limite].strip("-") or "sem-fala"
+
+
+def hms(seg):
+    seg = max(0, int(round(seg)))
+    return f"{seg // 3600:02d}:{(seg % 3600) // 60:02d}:{seg % 60:02d}"
+
+
+def rodar(cmd):
+    return subprocess.run(cmd, capture_output=True, text=True)
+
+
+def exige(programa):
+    if shutil.which(programa) is None:
+        sys.exit(f"aroll: '{programa}' nao encontrado. Instale antes de rodar.")
+
+
+# ----------------------------------------------------------------------------
+# 1. leitura do arquivo
+# ----------------------------------------------------------------------------
+
+
+def info_video(caminho):
+    """devolve (duracao, largura, altura, bitrate, tem_audio) ou None se ilegivel"""
+    r = rodar([
+        "ffprobe", "-v", "error", "-show_entries",
+        "format=duration:stream=codec_type,width,height,bit_rate",
+        "-of", "json", caminho,
+    ])
+    if r.returncode != 0:
+        return None
+    try:
+        d = json.loads(r.stdout)
+    except json.JSONDecodeError:
+        return None
+
+    dur = float(d.get("format", {}).get("duration") or 0)
+    largura = altura = 0
+    bitrate = 0
+    tem_audio = False
+    for s in d.get("streams", []):
+        if s.get("codec_type") == "video" and not largura:
+            largura = int(s.get("width") or 0)
+            altura = int(s.get("height") or 0)
+            try:
+                bitrate = int(s.get("bit_rate") or 0)
+            except (TypeError, ValueError):
+                bitrate = 0
+        if s.get("codec_type") == "audio":
+            tem_audio = True
+    if dur <= 0 or not largura:
+        return None
+    return dur, largura, altura, bitrate, tem_audio
+
+
+def extrair_audio(caminho, destino):
+    """audio em wav 16kHz mono — formato que o whisper espera"""
+    r = rodar([
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+        "-i", caminho, "-vn", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le",
+        destino,
+    ])
+    return r.returncode == 0 and os.path.exists(destino)
+
+
+# ----------------------------------------------------------------------------
+# 2. onde tem gente falando
+# ----------------------------------------------------------------------------
+
+
+def escutar(wav, tmp, idioma, duracao):
+    """
+    Devolve [(inicio, fim, texto, confianca)] — um item por frase falada.
+
+    Quem separa voz de barulho e o detector de voz (VAD), nao o silencio: em
+    locacao com ambiente (cozinha, rua, bar) o ruido vive acima de qualquer
+    limiar de silencio, e o arquivo inteiro viraria um bloco so.
+
+    Dois filtros derrubam o que o modelo inventa em cima de barulho:
+
+      densidade  — o whisper alucina frase curta em cima de trecho longo de
+                   ambiente ("E ai" em 14 segundos de barulho de cozinha).
+                   Fala de verdade da 10 a 25 caracteres por segundo.
+      confianca  — media dos tokens; pega o que ele mesmo nao acredita.
+
+    A densidade e o filtro que importa: aquele "E ai" de 14s veio com
+    confianca 0.98, entao so a confianca nao pegaria.
+    """
+    prefixo = os.path.join(tmp, "trans")
+    r = rodar([
+        "whisper-cli", "-m", MODELO_WHISPER, "-f", wav,
+        "-l", idioma, "-mc", "0", "-np",
+        "--vad", "--vad-model", MODELO_VAD,
+        "-ojf", "-of", prefixo,
+    ])
+    caminho = prefixo + ".json"
+    if r.returncode != 0 or not os.path.exists(caminho):
+        return None
+    try:
+        with open(caminho, encoding="utf-8") as f:
+            d = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return None
+
+    trechos = []
+    for seg in d.get("transcription", []):
+        off = seg.get("offsets") or {}
+        ini = float(off.get("from", 0)) / 1000.0
+        fim = min(float(off.get("to", 0)) / 1000.0, duracao)
+        texto = (seg.get("text") or "").strip()
+        tokens = [t for t in seg.get("tokens", [])
+                  if not (t.get("text") or "").startswith("[_")]
+        if fim <= ini or not texto or not tokens:
+            continue
+        ps = [float(t.get("p") or 0) for t in tokens]
+        confianca = sum(ps) / len(ps)
+        densidade = len(texto) / max(0.1, fim - ini)
+        if confianca < CONFIANCA_MINIMA or densidade < DENSIDADE_MINIMA:
+            continue
+        limpo = normaliza(texto)
+        if any(re.fullmatch(a, limpo) for a in ALUCINACOES):
+            continue
+        trechos.append((ini, fim, texto, confianca))
+    return sorted(trechos)
+
+
+def achar_padroes(trechos, padroes):
+    """
+    Acha os padroes no texto e devolve [(inicio, fim, trecho)].
+
+    A hora e estimada pela posicao da palavra dentro da frase: com o detector
+    de voz ligado, o whisper nao devolve hora por palavra na linha do tempo do
+    arquivo original. Como as frases sao curtas, o erro fica pequeno.
+    """
+    achados = []
+    for ini, fim, texto, _c in trechos:
+        n = normaliza(texto)
+        if not n:
+            continue
+        dur = fim - ini
+        for padrao in padroes:
+            for m in re.finditer(rf"(?<![a-z0-9]){padrao}(?![a-z0-9])", n):
+                achados.append((ini + dur * m.start() / len(n),
+                                ini + dur * m.end() / len(n),
+                                m.group(0)))
+    return sorted(achados)
+
+
+# ----------------------------------------------------------------------------
+# 3. quem esta em quadro
+# ----------------------------------------------------------------------------
+
+
+DETECTOR = os.path.join(os.path.dirname(os.path.realpath(__file__)), "aroll-pessoas")   # o install.sh compila de src/
+
+
+def tem_pessoa_em_quadro(caminho, ini, fim, tmp):
+    """
+    Olha alguns quadros do trecho e diz se tem gente em destaque na cena.
+
+    Sem isso, entra como A-roll todo clipe em que alguem fala fora de quadro
+    dando direcao ("vai la", "pega o filao") com a camera no prato.
+
+    Devolve (tem_pessoa, maior_area, maior_rosto). Se o detector nao estiver
+    disponivel, devolve (True, ...) — melhor deixar passar do que sumir com
+    material sem o usuario saber.
+    """
+    if not os.path.exists(DETECTOR):
+        return True, -1.0, -1.0
+
+    imagens = []
+    for k in range(QUADROS_TESTE):
+        t = ini + (fim - ini) * (k + 0.5) / QUADROS_TESTE
+        img = os.path.join(tmp, f"q{k}.jpg")
+        r = rodar([
+            "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+            "-ss", f"{t:.3f}", "-i", caminho, "-frames:v", "1",
+            "-vf", "scale=640:-2", img,
+        ])
+        if r.returncode == 0 and os.path.exists(img):
+            imagens.append(img)
+    if not imagens:
+        return True, -1.0, -1.0
+
+    r = rodar([DETECTOR] + imagens)
+    maior_pessoa = maior_rosto = 0.0
+    for linha in (r.stdout or "").splitlines():
+        partes = linha.rsplit("\t", 2)
+        if len(partes) != 3:
+            continue
+        try:
+            maior_pessoa = max(maior_pessoa, float(partes[1]))
+            maior_rosto = max(maior_rosto, float(partes[2]))
+        except ValueError:
+            continue
+    for img in imagens:
+        try:
+            os.remove(img)
+        except OSError:
+            pass
+
+    tem = maior_pessoa >= LIMIAR_PESSOA or maior_rosto >= LIMIAR_ROSTO
+    return tem, maior_pessoa, maior_rosto
+
+
+# ----------------------------------------------------------------------------
+# 4. montagem dos takes
+# ----------------------------------------------------------------------------
+
+
+def agrupar(blocos, gap):
+    """junta trechos de fala separados por pausa curta"""
+    if not blocos:
+        return []
+    grupos = [list(blocos[0])]
+    for ini, fim in blocos[1:]:
+        if ini - grupos[-1][1] < gap:
+            grupos[-1][1] = max(grupos[-1][1], fim)
+        else:
+            grupos.append([ini, fim])
+    return [tuple(g) for g in grupos]
+
+
+def montar_takes(trechos, gatilhos, erros, gap):
+    """devolve lista de dicts: inicio, fim, com_gatilho, gatilho_fim, erro, texto"""
+    blocos = [(t[0], t[1]) for t in trechos]
+    takes = []
+
+    for g_ini, g_fim in agrupar(blocos, gap):
+        dentro = [g for g in gatilhos if g[1] >= g_ini - MARGEM and g[0] <= g_fim]
+        aberturas = [(g_ini, None)] + [(g[1], g[1]) for g in dentro]
+        fechamentos = [g[0] for g in dentro] + [g_fim]
+
+        for i, (comeco, gatilho_fim) in enumerate(aberturas):
+            fim = fechamentos[i]
+            fatia = [(a, b) for a, b in blocos if b > comeco + 0.05 and a < fim - 0.05]
+            if not fatia:
+                continue
+            inicio = max(fatia[0][0], comeco)
+            fim_fala = min(fatia[-1][1], fim)
+
+            erro = None
+            for e_ini, _e_fim, texto in erros:
+                if inicio < e_ini <= fim_fala:
+                    erro = (e_ini, texto)
+                    break
+            fim_real = erro[0] if erro else fim_fala
+
+            if fim_real - inicio <= 0:
+                continue
+
+            falado = " ".join(t[2] for t in trechos
+                              if t[0] >= inicio - 0.3 and t[0] < fim_real)
+            takes.append({
+                "inicio": inicio,
+                "fim": fim_real,
+                "com_gatilho": i > 0,
+                "gatilho_fim": gatilho_fim,
+                "erro": erro,
+                "texto": " ".join(falado.split()[:PALAVRAS_NOME]),
+            })
+    return takes
+
+
+def janela_de_corte(take, duracao):
+    """aplica a margem de 1s, sem invadir o gatilho nem estourar o arquivo"""
+    ini = take["inicio"] - MARGEM
+    if take["gatilho_fim"] is not None:
+        ini = max(ini, take["gatilho_fim"])
+    return max(0.0, ini), min(duracao, take["fim"] + MARGEM)
+
+
+# ----------------------------------------------------------------------------
+# 4. corte
+# ----------------------------------------------------------------------------
+
+
+def alvo_bitrate(largura, altura, bitrate_origem):
+    if largura >= 3840 or altura >= 2160:
+        alvo = 60_000_000
+    elif largura >= 1920 or altura >= 1080:
+        alvo = 25_000_000
+    elif largura >= 1280:
+        alvo = 12_000_000
+    else:
+        alvo = 8_000_000
+    if bitrate_origem > 0:
+        alvo = min(alvo, max(bitrate_origem, 4_000_000))
+    return alvo
+
+
+def cortar(origem, destino, ini, fim, bitrate):
+    dur = max(0.1, fim - ini)
+    base = [
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+        "-ss", f"{ini:.3f}", "-i", origem, "-t", f"{dur:.3f}",
+        "-map", "0:v:0", "-map", "0:a?",
+    ]
+    fim_cmd = ["-c:a", "aac", "-b:a", "256k", "-movflags", "+faststart", destino]
+
+    r = rodar(base + [
+        "-c:v", "h264_videotoolbox", "-b:v", str(bitrate), "-pix_fmt", "yuv420p",
+    ] + fim_cmd)
+    if r.returncode == 0 and os.path.exists(destino):
+        return True, ""
+
+    # placa de video recusou: cai pro encoder de software
+    r = rodar(base + [
+        "-c:v", "libx264", "-crf", "18", "-preset", "medium", "-pix_fmt", "yuv420p",
+    ] + fim_cmd)
+    if r.returncode == 0 and os.path.exists(destino):
+        return True, ""
+    erro = (r.stderr or "").strip().splitlines()
+    return False, erro[-1] if erro else "ffmpeg falhou"
+
+
+# ----------------------------------------------------------------------------
+# varredura
+# ----------------------------------------------------------------------------
+
+
+def listar_videos(raiz):
+    achados = []
+    for pasta, subpastas, arquivos in os.walk(raiz):
+        subpastas[:] = [s for s in subpastas if s != PASTA_SAIDA and not s.startswith(".")]
+        for nome in sorted(arquivos):
+            if nome.startswith("."):
+                continue
+            if os.path.splitext(nome)[1].lower() in EXTENSOES:
+                achados.append(os.path.join(pasta, nome))
+    return sorted(achados)
+
+
+def impressao_digital(caminho):
+    """
+    Assinatura barata pra achar copia identica: tamanho + inicio + fim do
+    arquivo. Ler 12 GB inteiro pra comparar sairia mais caro que reprocessar.
+    """
+    try:
+        tam = os.path.getsize(caminho)
+        with open(caminho, "rb") as f:
+            comeco = f.read(1 << 20)
+            if tam > (2 << 20):
+                f.seek(-(1 << 20), os.SEEK_END)
+                fim = f.read(1 << 20)
+            else:
+                fim = b""
+    except OSError:
+        return None
+    import hashlib
+    h = hashlib.md5()
+    h.update(str(tam).encode())
+    h.update(comeco)
+    h.update(fim)
+    return h.hexdigest()
+
+
+def prefixos(caminhos, raiz):
+    """stem unico por arquivo; se repetir em subpastas, entra o nome da pasta"""
+    contagem = {}
+    for c in caminhos:
+        stem = os.path.splitext(os.path.basename(c))[0]
+        contagem[stem] = contagem.get(stem, 0) + 1
+
+    mapa = {}
+    for c in caminhos:
+        stem = os.path.splitext(os.path.basename(c))[0]
+        if contagem[stem] > 1:
+            rel = os.path.relpath(os.path.dirname(c), raiz)
+            pasta = "" if rel == "." else slug(rel.replace(os.sep, "-"), 30)
+            mapa[c] = f"{pasta}-{slug(stem, 40)}" if pasta else slug(stem, 40)
+        else:
+            mapa[c] = slug(stem, 40)
+    return mapa
+
+
+# ----------------------------------------------------------------------------
+# principal
+# ----------------------------------------------------------------------------
+
+
+def processar(caminho, prefixo, saida, opcoes):
+    """devolve dict com o resultado do arquivo, pra tela e pro relatorio"""
+    res = {"arquivo": caminho, "status": "", "takes": [], "nota": ""}
+    seco, refaz = opcoes["seco"], opcoes["refaz"]
+
+    if not refaz and not seco and os.path.isdir(saida):
+        if any(n.startswith(prefixo + "_take") for n in os.listdir(saida)):
+            res["status"] = "ja processado"
+            return res
+
+    info = info_video(caminho)
+    if info is None:
+        res["status"] = "ilegivel"
+        return res
+    duracao, largura, altura, bitrate, tem_audio = info
+
+    if not tem_audio:
+        res["status"] = "B-roll (sem faixa de audio)"
+        return res
+
+    tmp = tempfile.mkdtemp(prefix="aroll-")
+    try:
+        wav = os.path.join(tmp, "audio.wav")
+        if not extrair_audio(caminho, wav):
+            res["status"] = "falha ao extrair audio"
+            return res
+
+        trechos = escutar(wav, tmp, opcoes["idioma"], duracao)
+        if trechos is None:
+            res["status"] = "falha na transcricao"
+            return res
+        if not trechos:
+            res["status"] = "B-roll (sem voz)"
+            return res
+
+        gatilhos = achar_padroes(trechos, GATILHOS)
+        erros = achar_padroes(trechos, ERROS)
+        takes = montar_takes(trechos, gatilhos, erros, opcoes["gap"])
+
+        if not takes:
+            res["status"] = "nenhum take aproveitavel"
+            return res
+
+        notas = []
+
+        # recorte curto cai fora antes de qualquer coisa cara: nao vale extrair
+        # quadro nem recodificar o que ja esta condenado
+        if DURACAO_MINIMA > 0:
+            longos = []
+            for t in takes:
+                ini, fim = janela_de_corte(t, duracao)
+                if fim - ini >= DURACAO_MINIMA:
+                    longos.append(t)
+            curtos = len(takes) - len(longos)
+            if not longos:
+                res["status"] = f"nenhum recorte chega a {DURACAO_MINIMA:.0f}s"
+                return res
+            if curtos:
+                notas.append(f"{curtos} recorte(s) descartado(s): menos de {DURACAO_MINIMA:.0f}s")
+            takes = longos
+
+        # so e talking head se tiver gente em quadro
+        if opcoes["olhar"]:
+            aprovados, fora = [], []
+            for t in takes:
+                jan = janela_de_corte(t, duracao)
+                tem, pessoa, rosto = tem_pessoa_em_quadro(caminho, jan[0], jan[1], tmp)
+                t["pessoa"], t["rosto"] = pessoa, rosto
+                (aprovados if tem else fora).append(t)
+            if not aprovados:
+                maior = max((t["pessoa"] for t in fora), default=0)
+                res["status"] = "B-roll (fala fora de quadro)"
+                res["nota"] = (f"tem fala, mas ninguem em destaque na cena "
+                               f"(maior pessoa: {maior:.2f} do quadro)")
+                return res
+            if fora:
+                notas.append(f"{len(fora)} take(s) descartado(s): fala fora de quadro")
+            takes = aprovados
+
+        if not gatilhos and not notas:
+            notas.append("sem gatilho — take veio so da deteccao de voz")
+
+        res["nota"] = "; ".join(notas)
+        res["status"] = f"{len(takes)} take(s)"
+        for i, t in enumerate(takes, 1):
+            ini, fim = janela_de_corte(t, duracao)
+            marca = "_ERRO" if t["erro"] else ""
+            nome = f"{prefixo}_take{i:02d}{marca}_{slug(t['texto'])}.mp4"
+            item = {
+                "n": i, "ini": ini, "fim": fim, "nome": nome,
+                "erro": t["erro"][1] if t["erro"] else None,
+                "texto": t["texto"], "com_gatilho": t["com_gatilho"],
+                "ok": None, "motivo": "",
+            }
+            if not seco:
+                os.makedirs(saida, exist_ok=True)
+                ok, motivo = cortar(caminho, os.path.join(saida, nome), ini, fim,
+                                    alvo_bitrate(largura, altura, bitrate))
+                item["ok"], item["motivo"] = ok, motivo
+            res["takes"].append(item)
+        return res
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def imprimir(res, raiz):
+    rel = os.path.relpath(res["arquivo"], raiz)
+    print(f"\n{rel}  — {res['status']}")
+    if res["nota"]:
+        print(f"  ({res['nota']})")
+    for t in res["takes"]:
+        marca = f"  ERRO (\"{t['erro']}\")" if t["erro"] else ""
+        falhou = "" if t["ok"] in (None, True) else "  [FALHOU]"
+        print(f"  take {t['n']:02d}   {hms(t['ini'])} -> {hms(t['fim'])}"
+              f"   \"{t['texto']}\"{marca}{falhou}")
+
+
+def escrever_relatorio(resultados, raiz, saida, seco):
+    linhas = ["# Relatorio aroll", "", f"Pasta: `{raiz}`", ""]
+    if seco:
+        linhas += ["**Modo seco — nada foi cortado.**", ""]
+
+    bons = sum(1 for r in resultados for t in r["takes"] if not t["erro"])
+    ruins = sum(1 for r in resultados for t in r["takes"] if t["erro"])
+    broll = sum(1 for r in resultados if r["status"].startswith("B-roll"))
+    linhas += [
+        f"- Arquivos vistos: {len(resultados)}",
+        f"- Takes sem erro: {bons}",
+        f"- Takes com erro: {ruins}",
+        f"- Pulados como B-roll: {broll}",
+        "",
+    ]
+
+    for r in resultados:
+        rel = os.path.relpath(r["arquivo"], raiz)
+        linhas += [f"## {rel}", "",
+                   r["status"] + (f" — {r['nota']}" if r["nota"] else ""), ""]
+        if r["takes"]:
+            linhas += ["| take | inicio | fim | fala | erro | gatilho |",
+                       "|---|---|---|---|---|---|"]
+            for t in r["takes"]:
+                linhas.append(
+                    f"| {t['n']:02d} | {hms(t['ini'])} | {hms(t['fim'])} | "
+                    f"{t['texto']} | {t['erro'] or ''} | "
+                    f"{'sim' if t['com_gatilho'] else 'nao'} |")
+            linhas.append("")
+
+    os.makedirs(saida, exist_ok=True)
+    destino = os.path.join(saida, "relatorio.md")
+    with open(destino, "w", encoding="utf-8") as f:
+        f.write("\n".join(linhas) + "\n")
+    return destino
+
+
+def main():
+    args = sys.argv[1:]
+    opcoes = {
+        "seco": "--seco" in args,
+        "refaz": "--refaz" in args,
+        "idioma": "pt",
+        "gap": 10 ** 9 if "--aparar" in args else GAP_TAKE,
+        "olhar": "--so-audio" not in args,
+    }
+    if "--idioma" in args:
+        i = args.index("--idioma")
+        if i + 1 < len(args):
+            opcoes["idioma"] = args[i + 1]
+            args.pop(i + 1)
+        args.pop(i)
+    pastas = [a for a in args if not a.startswith("--")]
+
+    if len(pastas) != 1:
+        sys.exit("uso: aroll <pasta> [--seco] [--aparar] [--so-audio] [--refaz] [--idioma pt]")
+
+    raiz = os.path.abspath(os.path.expanduser(pastas[0]))
+    if not os.path.isdir(raiz):
+        sys.exit(f"aroll: '{raiz}' nao e uma pasta")
+
+    for p in ("ffmpeg", "ffprobe", "whisper-cli"):
+        exige(p)
+    if not os.path.exists(MODELO_WHISPER):
+        sys.exit(f"aroll: modelo do whisper nao encontrado em {MODELO_WHISPER}")
+    if not os.path.exists(MODELO_VAD):
+        sys.exit(
+            f"aroll: modelo de deteccao de voz nao encontrado em {MODELO_VAD}\n"
+            "  baixe com:\n"
+            f"  curl -L -o {MODELO_VAD} \\\n"
+            "    https://huggingface.co/ggml-org/whisper-vad/resolve/main/ggml-silero-v5.1.2.bin")
+
+    videos = listar_videos(raiz)
+    if not videos:
+        sys.exit(f"aroll: nenhum video encontrado em {raiz}")
+
+    saida = os.path.join(raiz, PASTA_SAIDA)
+    mapa = prefixos(videos, raiz)
+
+    print(f"aroll — {len(videos)} arquivo(s) em {raiz}")
+    if opcoes["seco"]:
+        print("modo seco: nada sera cortado")
+    if opcoes["gap"] > GAP_TAKE:
+        print("modo aparar: um take por arquivo")
+    print()
+
+    resultados = []
+    vistos = {}
+    for n, caminho in enumerate(videos, 1):
+        print(f"[{n}/{len(videos)}] {os.path.relpath(caminho, raiz)} ...", flush=True)
+        digital = impressao_digital(caminho)
+        if digital and digital in vistos:
+            gemeo = os.path.relpath(vistos[digital], raiz)
+            res = {"arquivo": caminho, "takes": [], "nota": "",
+                   "status": f"copia identica de {gemeo} — pulado"}
+        else:
+            if digital:
+                vistos[digital] = caminho
+            res = processar(caminho, mapa[caminho], saida, opcoes)
+        resultados.append(res)
+        imprimir(res, raiz)
+
+    destino = escrever_relatorio(resultados, raiz, saida, opcoes["seco"])
+    bons = sum(1 for r in resultados for t in r["takes"] if not t["erro"])
+    ruins = sum(1 for r in resultados for t in r["takes"] if t["erro"])
+    broll = sum(1 for r in resultados if r["status"].startswith("B-roll"))
+    print(f"\n{bons} take(s) sem erro, {ruins} com erro, {broll} arquivo(s) de B-roll.")
+    print(f"Relatorio: {destino}")
+    if not opcoes["seco"]:
+        print(f"Saida: {saida}")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.exit("\ninterrompido")

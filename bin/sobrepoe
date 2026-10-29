@@ -1,0 +1,4 @@
+#!/bin/zsh
+# sobrepoe: ver README.md. Roda o módulo comandos.sobrepoe com o venv do kit.
+RAIZ="${0:A:h:h}"
+PYTHONPATH="$RAIZ" exec "$RAIZ/venv/bin/python" -m comandos.sobrepoe "$@"

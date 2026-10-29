@@ -1,0 +1,68 @@
+#!/bin/zsh
+# compila — funde subpastas duplicadas ("NOME", "NOME 2", "NOME 3"...) na pasta certa
+# Uso: compila [pasta]   (sem argumento = pasta atual; caminho com espaço precisa de aspas)
+
+compila() {
+  setopt local_options null_glob
+  if (( $# > 1 )); then
+    echo "erro: recebi $# argumentos — se o caminho tem espaço, use aspas: compila \"/pasta/com espaco\"" >&2
+    return 1
+  fi
+  local raiz="${1:-$PWD}"
+  raiz="${raiz:A}"
+  if [[ ! -d "$raiz" ]]; then
+    echo "erro: pasta nao existe: $raiz" >&2
+    return 1
+  fi
+  local nome="${raiz:t}"
+  local sub base destino f rel alvo i
+  local -i movidos=0 dups=0 grupos=0
+  local -A cnt
+  # 1o passe: conta quantas subpastas compartilham cada nome-base (sem o sufixo " 2", " 3"...)
+  for sub in "$raiz"/*(/); do
+    base="${sub:t}"
+    [[ "$base" =~ '^(.*[^ ]) [0-9]+$' ]] && base="$match[1]"
+    cnt[$base]=$(( ${cnt[$base]:-0} + 1 ))
+  done
+  # 2o passe: funde cada grupo
+  for sub in "$raiz"/*(/); do
+    base="${sub:t}"
+    [[ "$base" =~ '^(.*[^ ]) [0-9]+$' ]] && base="$match[1]"
+    if [[ "$base" == "$nome" ]]; then
+      destino="$raiz"                          # subpasta com o nome da raiz -> funde na raiz
+    elif (( cnt[$base] >= 2 )); then
+      destino="$raiz/$base"                    # grupo de irmas duplicadas -> funde na de nome-base
+      [[ "$sub" == "$destino" ]] && continue   # a propria pasta-base fica onde esta
+      mkdir -p "$destino"
+    else
+      continue                                 # subpasta unica de outro nome -> nao mexe
+    fi
+    (( grupos++ ))
+    find "$sub" -type f ! -name '.DS_Store' | while IFS= read -r f; do
+      rel="${f#"$sub"/}"
+      alvo="$destino/$rel"
+      mkdir -p "${alvo%/*}"
+      if [[ ! -e "$alvo" ]]; then
+        mv "$f" "$alvo"; (( movidos++ ))
+      elif cmp -s "$f" "$alvo"; then
+        rm "$f"; (( dups++ ))
+        echo "  duplicata identica descartada: ${sub:t}/$rel"
+      else
+        i=2
+        while [[ -e "${alvo%.*} $i.${alvo##*.}" ]]; do (( i++ )); done
+        mv "$f" "${alvo%.*} $i.${alvo##*.}"; (( movidos++ ))
+        echo "  CONFLITO (conteudo diferente), renomeado: ${sub:t}/$rel -> ${${alvo%.*}:t} $i.${alvo##*.}"
+      fi
+    done
+    find "$sub" -name '.DS_Store' -delete
+    find "$sub" -type d -empty -delete
+    [[ -d "$sub" ]] && echo "  aviso: '${sub:t}' nao ficou vazia, mantida"
+  done
+  if (( grupos == 0 )); then
+    echo "nada pra compilar: nenhuma subpasta duplicada em $raiz"
+  else
+    echo "pronto: $movidos arquivo(s) movido(s), $dups duplicata(s) descartada(s) em $raiz"
+  fi
+}
+
+compila "$@"

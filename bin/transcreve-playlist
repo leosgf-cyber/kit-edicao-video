@@ -1,0 +1,274 @@
+#!/bin/zsh
+# transcreve-playlist — transcreve uma playlist inteira do YouTube, um video por vez.
+#
+# Uso:
+#   transcreve-playlist "<url da playlist>" [idioma] [quantos]
+#
+#   idioma : auto (padrao, detecta sozinho) | pt | en | es ...
+#   quantos: para depois de N videos nesta rodada (padrao: vai ate o fim)
+#
+# Como funciona:
+#   baixa 1 audio -> transcreve -> apaga o audio -> proximo
+#   (nunca acumula download, entao nao entope o disco)
+#
+# Da pra parar (Ctrl-C) e rodar de novo quando quiser: ele pula o que ja fez.
+#
+# Saida:  ~/Documents/Transcrições/PLAYLISTS/<nome da playlist>/
+#           NNN - titulo do video.txt   -> as transcricoes (texto corrido)
+#           NNN - titulo do video.srt   -> as mesmas, com timestamps
+#           _feitos.txt                 -> ids ja transcritos (controle do "pular")
+#           _falhas.txt                 -> o que deu errado, com o motivo
+#           _log.txt                    -> log completo
+
+emulate -L zsh
+setopt null_glob
+
+MODELO="${KIT_VIDEO_MODELOS:-$HOME/.kit-video/modelos}/ggml-large-v3-turbo.bin"
+RAIZ="$HOME/Documents/Transcrições/PLAYLISTS"
+
+msg() { print -r -- "$@"; [[ -n "$LOG" ]] && print -r -- "$@" >>"$LOG"; }
+
+sanitiza() {
+  setopt local_options extendedglob
+  local s="$1"
+  s="${s//$'\n'/ }"
+  s="${s//\//-}"          # barra quebra caminho
+  s="${s//:/ -}"
+  s="${s//\"/}"
+  s="${s//[[:cntrl:]]/}"
+  s="${s##[[:space:]]#}"
+  s="${s%%[[:space:]]#}"
+  s="${s[1,90]}"
+  s="${s%%[[:space:]]#}"
+  [[ -z "$s" ]] && s="sem-titulo"
+  print -r -- "$s"
+}
+
+# Apaga pastas temporarias de rodadas que morreram sem limpar (kill -9, queda de luz).
+# O nome da pasta termina no PID do dono, entao da pra checar se ele ainda esta vivo.
+limpa_orfas() {
+  setopt local_options null_glob
+  local d pid n=0
+  for d in "${TMPDIR:-/tmp}"/transcreve_pl_*; do
+    [[ -d "$d" ]] || continue
+    pid="${d##*_}"
+    [[ "$pid" == <-> ]] || continue
+    # ps -p em vez de kill -0: kill -0 falha por permissao em processo de outro
+    # dono e faria o script achar que ele morreu
+    ps -p "$pid" >/dev/null 2>&1 && continue   # dono vivo: nao e orfa, nao encosta
+    rm -rf "$d" && (( n++ ))
+  done
+  (( n > 0 )) && print -r -- "🧹 limpei $n pasta(s) temporaria(s) de rodada interrompida"
+  return 0
+}
+
+hm() {  # segundos -> "3h 12min"
+  local t=${1%.*}
+  (( t < 0 )) && t=0
+  printf '%dh %02dmin' $(( t / 3600 )) $(( (t % 3600) / 60 ))
+}
+
+main() {
+  local url="$1" idioma="${2:-auto}" quantos="${3:-0}"
+
+  if [[ -z "$url" ]]; then
+    print -u2 "uso: transcreve-playlist \"<url da playlist>\" [idioma]"
+    return 1
+  fi
+  if [[ ! -f "$MODELO" ]]; then
+    print -u2 "❌ modelo do whisper nao encontrado em: $MODELO"; return 1
+  fi
+  local prog
+  for prog in yt-dlp ffmpeg whisper-cli python3; do
+    if ! command -v "$prog" >/dev/null; then print -u2 "❌ falta o $prog"; return 1; fi
+  done
+
+  limpa_orfas
+
+  local tmp="${TMPDIR:-/tmp}/transcreve_pl_$$"
+  mkdir -p "$tmp"
+  local cookies="$tmp/cookies.txt"
+
+  # limpeza garantida: fim normal, erro, kill/pkill, terminal fechado.
+  # (kill -9 nao da pra interceptar — quem cobre esse caso e o limpa_orfas acima)
+  # TERM/HUP precisam do 'exit' explicito: capturar o sinal NAO encerra o script,
+  # so desvia pro trap — sem isso ele seguiria rodando sem pasta temporaria.
+  trap 'rm -rf "$tmp"' EXIT
+  trap 'rm -rf "$tmp"; exit 143' TERM
+  trap 'rm -rf "$tmp"; exit 129' HUP
+
+  # ---- lista da playlist (e de quebra exporta os cookies do Chrome uma vez so) ----
+  print -r -- "⬇️  lendo a playlist..."
+  if ! yt-dlp --flat-playlist -J --no-warnings \
+        --cookies-from-browser chrome --cookies "$cookies" \
+        "$url" > "$tmp/pl.json" 2>"$tmp/pl.err"; then
+    print -u2 "❌ nao consegui ler a playlist:"; print -u2 "$(tail -3 "$tmp/pl.err")"
+    rm -rf "$tmp"; return 1
+  fi
+
+  local -a ck
+  if [[ -s "$cookies" ]]; then ck=( --cookies "$cookies" )
+  else ck=( --cookies-from-browser chrome ); fi
+
+  # id <TAB> duracao <TAB> titulo
+  python3 - "$tmp/pl.json" > "$tmp/lista.tsv" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+print(d.get('title') or 'playlist')
+for e in (d.get('entries') or []):
+    if not e: continue
+    vid = e.get('id') or ''
+    if not vid: continue
+    dur = int(e.get('duration') or 0)
+    tit = (e.get('title') or vid).replace('\t', ' ').replace('\n', ' ')
+    print(f"{vid}\t{dur}\t{tit}")
+PY
+
+  local nome_pl="$(sanitiza "$(head -1 "$tmp/lista.tsv")")"
+  local dest="$RAIZ/$nome_pl"
+  mkdir -p "$dest"
+  LOG="$dest/_log.txt"
+  local feitos="$dest/_feitos.txt" falhas="$dest/_falhas.txt"
+  touch "$feitos" "$falhas"
+
+  local -a linhas
+  linhas=( "${(@f)$(tail -n +2 "$tmp/lista.tsv")}" )
+  linhas=( "${(@)linhas:#}" )
+  local total=${#linhas}
+
+  # ---- quanto falta de verdade (descontando o que ja foi feito) ----
+  # com trava (quantos>0), a conta e SO desta rodada, nao da playlist toda
+  local id dur titulo restante_seg=0 pendentes=0 alvo=0
+  local l
+  for l in "${linhas[@]}"; do
+    id="${l%%$'\t'*}"
+    grep -qxF -- "$id" "$feitos" && continue
+    dur="${${l#*$'\t'}%%$'\t'*}"
+    (( pendentes++ ))
+    if (( quantos == 0 || alvo < quantos )); then
+      (( restante_seg += dur )); (( alvo++ ))
+    fi
+  done
+
+  msg ""
+  msg "🎬 playlist : $nome_pl"
+  msg "📺 videos   : $total  (pendentes: $pendentes, ja feitos: $(( total - pendentes )))"
+  if (( quantos > 0 )); then
+    msg "🎯 rodada   : $alvo video(s) — trava de $quantos"
+  fi
+  msg "⏱  audio    : $(hm $restante_seg) a transcrever$( (( quantos > 0 )) && print -n ' nesta rodada')"
+  msg "🗣  idioma   : $idioma"
+  msg "📂 destino  : $dest"
+  msg ""
+
+  if (( pendentes == 0 )); then
+    msg "✅ ja esta tudo transcrito. nada a fazer."
+    rm -rf "$tmp"; return 0
+  fi
+
+  # nao deixa a maquina dormir enquanto isso roda
+  caffeinate -i -w $$ &>/dev/null &
+
+  local inicio=$SECONDS
+  local ok=0 erro=0 pulados=0 i=0
+  local audio_feito=0 gasto=0
+
+  trap 'print ""; print "⏸  interrompido — o progresso esta salvo, e so rodar de novo."; rm -rf "$tmp"; return 130' INT
+
+  local arq wav saida idx eta vel t0 tv
+  local -a achados
+
+  for l in "${linhas[@]}"; do
+    (( i++ ))
+    id="${l%%$'\t'*}"
+    dur="${${l#*$'\t'}%%$'\t'*}"
+    titulo="${l#*$'\t'*$'\t'}"
+    idx="$(printf '%03d' $i)"
+
+    if grep -qxF -- "$id" "$feitos"; then (( pulados++ )); continue; fi
+
+    saida="$dest/$idx - $(sanitiza "$titulo")"
+    print -r -- ""
+    print -r -- "🎙  [$i/$total] $titulo"
+
+    t0=$SECONDS
+    rm -f "$tmp"/audio.*
+
+    if ! yt-dlp --no-playlist -x --no-warnings --retries 5 "${ck[@]}" \
+          -o "$tmp/audio.%(ext)s" "https://www.youtube.com/watch?v=$id" \
+          >>"$LOG" 2>&1; then
+      print -r -- "   ❌ download falhou"
+      printf '%s\t%s\t%s\n' "$id" "download falhou" "$titulo" >>"$falhas"
+      (( erro++ )); continue
+    fi
+
+    achados=( "$tmp"/audio.* )
+    if (( ${#achados} == 0 )); then
+      print -r -- "   ❌ nao veio arquivo de audio"
+      printf '%s\t%s\t%s\n' "$id" "sem arquivo de audio" "$titulo" >>"$falhas"
+      (( erro++ )); continue
+    fi
+    arq="${achados[1]}"
+
+    wav="$tmp/audio.wav"
+    if ! ffmpeg -y -i "$arq" -ar 16000 -ac 1 -c:a pcm_s16le "$wav" -loglevel error; then
+      print -r -- "   ❌ conversao falhou"
+      printf '%s\t%s\t%s\n' "$id" "ffmpeg falhou" "$titulo" >>"$falhas"
+      rm -f "$arq" "$wav"; (( erro++ )); continue
+    fi
+
+    # -mc 0 = nao carrega contexto entre trechos (evita loop de alucinacao em musica)
+    whisper-cli -m "$MODELO" -f "$wav" -l "$idioma" -mc 0 -otxt -osrt -of "$saida" -pp \
+      2>&1 >/dev/null \
+      | while IFS= read -r linha; do
+          [[ "$linha" == *progress*=* ]] || continue
+          pct="${linha##*= }"; pct="${pct%\%}"; pct="${pct// /}"
+          cheio=$(( pct / 5 )); barra=""
+          (( cheio > 0 )) && barra="$(printf '█%.0s' {1..$cheio})"
+          printf '\r   [%-20s] %3d%%' "$barra" "$pct"
+        done
+
+    if [[ ! -s "$saida.txt" ]]; then
+      printf '\r%-60s\r' " "
+      print -r -- "   ❌ whisper falhou"
+      printf '%s\t%s\t%s\n' "$id" "whisper falhou" "$titulo" >>"$falhas"
+      rm -f "$arq" "$wav" "$saida.srt"; (( erro++ )); continue
+    fi
+    printf '\r   [████████████████████] 100%%\n'
+
+    rm -f "$arq" "$wav"
+    print -r -- "$id" >>"$feitos"
+    (( ok++ ))
+
+    tv=$(( SECONDS - t0 ))
+    (( gasto += tv )); (( audio_feito += dur )); (( restante_seg -= dur ))
+    print -r -- "   📝 ${saida:t}.txt + .srt  ($(hm $tv) / $(hm $dur) de audio)"
+    if (( audio_feito > 0 && gasto > 0 )); then
+      vel=$(( audio_feito * 1.0 / gasto ))
+      eta=$(( restante_seg / vel ))
+      printf '   ⏳ %.1fx tempo real — faltam ~%s (%d de %d)\n' $vel "$(hm $eta)" $(( ok + erro )) $alvo
+    fi
+    msg "   ✔ $idx - $titulo"
+
+    if (( quantos > 0 && ok >= quantos )); then
+      print -r -- ""
+      print -r -- "🛑 parei em $ok video(s), como pedido. rode de novo pra continuar de onde parou."
+      break
+    fi
+  done
+
+  trap - INT
+  rm -rf "$tmp"
+
+  msg ""
+  msg "════════════════════════════════════"
+  msg "✅ transcritos agora : $ok"
+  msg "⏭  ja estavam prontos: $pulados"
+  msg "❌ falharam          : $erro"
+  msg "🕐 tempo total       : $(hm $(( SECONDS - inicio )))"
+  msg "📂 $dest"
+  (( erro > 0 )) && msg "   (o que falhou esta em $falhas — e so rodar o comando de novo pra tentar so eles)"
+  msg "════════════════════════════════════"
+}
+
+main "$@"

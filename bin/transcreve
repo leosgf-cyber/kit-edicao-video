@@ -1,0 +1,148 @@
+#!/bin/zsh
+# transcreve: transcreve áudio/vídeo com o whisper, 100% local (offline, sem token)
+#   transcreve                              -> audio mais recente do ~/Downloads
+#   transcreve arquivo.opus                 -> transcreve esse arquivo
+#   transcreve arquivo.m4a en               -> forca outro idioma (padrao: pt)
+#   transcreve "<url>"                      -> baixa o audio (yt-dlp: YouTube, Instagram,
+#                                              TikTok, X, Vimeo...) numa pasta TEMPORARIA,
+#                                              transcreve e apaga o download no final
+#   transcreve "<pasta>"                    -> TODOS os audios da pasta
+#   transcreve "<pasta>" apos "2026-07-20"       -> so os apos essa data
+#   transcreve "<pasta>" apos "2026-07-20 14:30"  -> so os apos essa data/hora
+# Entregavel: .txt (texto corrido) + .srt (com timestamps)
+#             em ~/Documents/Transcrições/MM-AA/VIDEO (url ou arquivo de video)
+#             ou ~/Documents/Transcrições/MM-AA/AUDIO (arquivo/pasta de audio)
+#
+# Modelo: $KIT_VIDEO_MODELOS/ggml-large-v3-turbo.bin (o install.sh baixa).
+
+transcreve() {
+  emulate -L zsh
+  setopt local_options null_glob
+  local modelo="${KIT_VIDEO_MODELOS:-$HOME/.kit-video/modelos}/ggml-large-v3-turbo.bin"
+
+  # ---- parse dos argumentos ----
+  local alvo="" idioma="pt" apos=""
+  if (( $# > 0 )) && [[ "$1" != apos && "$1" != após && "$1" != idioma && "$1" != lang && "$1" != -a && "$1" != -l ]]; then
+    alvo="$1"; shift
+  fi
+  while (( $# > 0 )); do
+    case "$1" in
+      apos|após|-a)   apos="$2"; shift 2 ;;
+      idioma|lang|-l) idioma="$2"; shift 2 ;;
+      *)              idioma="$1"; shift ;;
+    esac
+  done
+
+  if [[ ! -f "$modelo" ]]; then
+    echo "❌ Modelo do whisper nao encontrado em: $modelo"; return 1
+  fi
+
+  # valida o corte de data, se houver (aceita "2026-07-20" ou "2026-07-20 14:30")
+  if [[ -n "$apos" ]]; then
+    if ! date -j -f "%Y-%m-%d %H:%M" "$apos" "+%s" >/dev/null 2>&1 \
+       && ! date -j -f "%Y-%m-%d" "$apos" "+%s" >/dev/null 2>&1; then
+      echo "❌ Data invalida: \"$apos\""
+      echo "   Use ano-mes-dia, ex:  2026-07-20   ou   \"2026-07-20 14:30\""
+      return 1
+    fi
+  fi
+
+  # ---- URL? baixa o audio numa pasta TEMPORARIA (yt-dlp, cookies do Chrome) ----
+  local -a baixados
+  local dl_dir=""
+  if [[ "$alvo" == http://* || "$alvo" == https://* ]]; then
+    echo "⬇️  Baixando audio de: $alvo"
+    dl_dir="${TMPDIR:-/tmp}/transcreve_dl_$$"
+    mkdir -p "$dl_dir"
+    yt-dlp --no-playlist -x --no-warnings --cookies-from-browser chrome \
+      -o "$dl_dir/%(title)s.%(ext)s" \
+      --no-simulate --print-to-file after_move:filepath "$dl_dir/lista.txt" "$alvo"
+    baixados=( "${(@f)$(cat "$dl_dir/lista.txt" 2>/dev/null)}" )
+    baixados=( "${(@)baixados:#}" )
+    if (( ${#baixados} == 0 )) || [[ ! -f "${baixados[1]}" ]]; then
+      rm -rf "$dl_dir"
+      echo "❌ Nao consegui baixar dessa URL (yt-dlp falhou)"; return 1
+    fi
+    echo "🎵 Baixado (temporario, sera apagado no final): ${baixados[1]:t}"
+  fi
+
+  # ---- montar a lista de audios ----
+  local -a extfind=( '(' -iname '*.opus' -o -iname '*.m4a' -o -iname '*.mp3' -o -iname '*.ogg' -o -iname '*.wav' -o -iname '*.aac' ')' )
+  local -a lista
+
+  if (( ${#baixados} > 0 )); then
+    lista=( "${baixados[@]}" )
+  elif [[ -n "$alvo" && -f "$alvo" ]]; then
+    lista=( "$alvo" )
+  else
+    local pasta="${alvo:-$HOME/Downloads}"
+    if [[ ! -d "$pasta" ]]; then
+      echo "❌ Nao achei arquivo nem pasta: $alvo"; return 1
+    fi
+    if [[ -z "$alvo" && -z "$apos" ]]; then
+      # 'transcreve' sozinho -> so o mais recente do Downloads
+      local -a audios=( "$pasta"/*.opus "$pasta"/*.m4a "$pasta"/*.ogg "$pasta"/*.mp3 "$pasta"/*.wav "$pasta"/*.aac )
+      if (( ${#audios} == 0 )); then echo "❌ Nenhum audio no ~/Downloads"; return 1; fi
+      lista=( "$(ls -t -- "${audios[@]}" | head -1)" )
+      echo "🎧 Audio mais recente: ${lista[1]:t}"
+    else
+      # pasta inteira (com corte de data opcional)
+      local -a findargs=( "$pasta" -maxdepth 1 -type f "${extfind[@]}" )
+      [[ -n "$apos" ]] && findargs+=( -newermt "$apos" )
+      lista=( "${(@f)$(find "${findargs[@]}" 2>/dev/null | sort)}" )
+      lista=( "${(@)lista:#}" )   # tira entradas vazias
+      if (( ${#lista} == 0 )); then
+        echo "❌ Nenhum audio${apos:+ apos \"$apos\"} em: $pasta"; return 1
+      fi
+      echo "📁 ${#lista} audio(s) em: $pasta${apos:+  (apos $apos)}"
+    fi
+  fi
+
+  # ---- pasta de destino: ~/Documents/Transcrições/MM-AA/{VIDEO,AUDIO} ----
+  local sub="AUDIO"
+  if [[ -n "$dl_dir" ]]; then
+    sub="VIDEO"   # veio de URL (YouTube, Instagram, TikTok...)
+  elif [[ "${lista[1]:e:l}" == (mp4|mov|mkv|webm|avi|m4v|mts) ]]; then
+    sub="VIDEO"   # arquivo local de video
+  fi
+  local destino="$HOME/Documents/Transcrições/$(date +%m-%y)/$sub"
+  mkdir -p "$destino"
+
+  # ---- transcrever cada audio ----
+  local arquivo wav saida seg pct cheio barra primeira i=0
+  for arquivo in "${lista[@]}"; do
+    [[ -f "$arquivo" ]] || continue
+    (( i++ ))
+    echo ""
+    echo "🎙️  [$i/${#lista}] ${arquivo:t}  (idioma: $idioma)"
+    wav="${TMPDIR:-/tmp}/transcreve_$$_$i.wav"
+    if ! ffmpeg -y -i "$arquivo" -ar 16000 -ac 1 -c:a pcm_s16le "$wav" -loglevel error; then
+      echo "   ❌ falhou na conversao, pulando"; rm -f "$wav"; continue
+    fi
+    saida="$destino/${arquivo:t:r}"
+    seg="${TMPDIR:-/tmp}/transcreve_seg_$$_$i.txt"
+    # segmentos ficam num temp (nao imprime); progresso do whisper (-pp) vira barrinha
+    whisper-cli -m "$modelo" -f "$wav" -l "$idioma" -otxt -osrt -of "$saida" -pp 2>&1 >"$seg" \
+      | while IFS= read -r linha; do
+          [[ "$linha" == *progress*=* ]] || continue
+          pct="${linha##*= }"; pct="${pct%\%}"; pct="${pct// /}"
+          cheio=$(( pct / 5 )); barra=""
+          (( cheio > 0 )) && barra="$(printf '█%.0s' {1..$cheio})"
+          printf '\r   [%-20s] %3d%%' "$barra" "$pct"
+        done
+    printf '\r   [████████████████████] 100%%\n'
+    rm -f "$wav"
+    primeira="$(grep -m1 -- '-->' "$seg")"
+    rm -f "$seg"
+    [[ -n "$primeira" ]] && echo "   👀 ${primeira}"
+    echo "   📝 ${saida}.txt  (+ .srt com timestamps)"
+  done
+
+  # apaga o download temporario (se veio de URL)
+  [[ -n "$dl_dir" ]] && rm -rf "$dl_dir"
+
+  echo ""
+  echo "✅ Pronto — $i transcricao(oes) em: $destino"
+}
+
+transcreve "$@"

@@ -1,0 +1,5 @@
+numpy
+scipy
+Pillow>=10.1
+pytest
+openpyxl

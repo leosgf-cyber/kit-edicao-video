@@ -1,0 +1,4 @@
+#!/bin/zsh
+# acha-offline: varre um render atrás da tela "Media Offline" do Resolve. Uso: acha-offline <video>
+RAIZ="${0:A:h:h}"
+exec "$RAIZ/venv/bin/python" "$RAIZ/comandos/acha_offline.py" "$@"

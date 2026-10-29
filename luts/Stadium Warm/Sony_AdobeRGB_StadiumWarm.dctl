@@ -1,0 +1,83 @@
+// ---------------------------------------------------------------------------
+// Sony (Adobe RGB, neutro)  ->  Stadium Warm / lifestyle esportivo
+// DCTL para DaVinci Resolve 20 Studio.
+//
+// Aplique num node sobre material Sony NEUTRO em Rec.709/Adobe RGB.
+// Mesmo look do LUT .cube: highlights ambar / sombras petroleo,
+// pretos levantados e azulados, vermelho+azul saturados, verde contido,
+// medios dourados, altas arejadas com roll-off suave.
+//
+// Roda em float (sem interpolacao de cubo) -> mais fiel que o .cube.
+// ---------------------------------------------------------------------------
+
+DEFINE_UI_PARAMS(gMix, Intensidade, DCTLUI_SLIDER_FLOAT, 1.0, 0.0, 1.0, 0.01)
+
+__DEVICE__ float ss(float a, float b, float x) {
+    float t = _clampf((x - a) / (b - a), 0.0f, 1.0f);
+    return t * t * (3.0f - 2.0f * t);
+}
+
+__DEVICE__ float lum3(float r, float g, float b) {
+    return 0.2126f * r + 0.7152f * g + 0.0722f * b;
+}
+
+__DEVICE__ float3 transform(int p_Width, int p_Height, int p_X, int p_Y,
+                            float p_R, float p_G, float p_B)
+{
+    float r = p_R, g = p_G, b = p_B;
+    float r0 = r, g0 = g, b0 = b;   // guarda original p/ o Mix
+
+    // 1) WB - tira o vies frio/verde da Sony
+    r = _clampf(r * 1.035f, 0.0f, 1.0f);
+    g = _clampf(g * 0.985f, 0.0f, 1.0f);
+    b = _clampf(b * 0.975f, 0.0f, 1.0f);
+
+    // 2) Lift-Gamma-Gain por canal (estilo ASC-CDL)
+    r = _clampf(r * (1.060f - 0.012f) + 0.012f, 0.0f, 1.0f);
+    g = _clampf(g * (1.010f - 0.020f) + 0.020f, 0.0f, 1.0f);
+    b = _clampf(b * (0.945f - 0.038f) + 0.038f, 0.0f, 1.0f);
+    r = _powf(r, 1.0f / 0.960f);
+    g = _powf(g, 1.0f / 0.980f);
+    b = _powf(b, 1.0f / 1.030f);
+
+    // 3) Split-tone por luminancia (coracao do quente-frio)
+    float l = lum3(r, g, b);
+    float sw = 1.0f - ss(0.0f, 0.45f, l);   // peso sombras
+    float hw = ss(0.55f, 1.0f, l);          // peso altas
+    r = _clampf(r + sw * (-0.030f) + hw * ( 0.030f), 0.0f, 1.0f);
+    g = _clampf(g + sw * ( 0.006f) + hw * ( 0.012f), 0.0f, 1.0f);
+    b = _clampf(b + sw * ( 0.032f) + hw * (-0.028f), 0.0f, 1.0f);
+
+    // 4) Contraste S suave (pivot 0.5)
+    r = _clampf(r + 0.16f * (r - 0.5f) * (1.0f - _fabs(r - 0.5f) * 2.0f), 0.0f, 1.0f);
+    g = _clampf(g + 0.16f * (g - 0.5f) * (1.0f - _fabs(g - 0.5f) * 2.0f), 0.0f, 1.0f);
+    b = _clampf(b + 0.16f * (b - 0.5f) * (1.0f - _fabs(b - 0.5f) * 2.0f), 0.0f, 1.0f);
+
+    // 5) Saturacao seletiva (vibrance: + vermelho/azul, freia verde)
+    l = lum3(r, g, b);
+    float rmask = ss(0.15f, 0.55f, r - _fmaxf(g, b));
+    float gmask = ss(0.10f, 0.45f, g - _fmaxf(r, b));
+    float bmask = ss(0.15f, 0.55f, b - _fmaxf(r, g));
+    float gr = 1.10f * (1.0f + 0.18f * rmask);
+    float gg = 1.10f * (1.0f - 0.10f * gmask);
+    float gb = 1.10f * (1.0f + 0.16f * bmask);
+    r = _clampf(l + (r - l) * gr, 0.0f, 1.0f);
+    g = _clampf(l + (g - l) * gg, 0.0f, 1.0f);
+    b = _clampf(l + (b - l) * gb, 0.0f, 1.0f);
+
+    // 6) Roll-off das altas -> arejado, sem cravar
+    if (r > 0.90f) r = 0.90f + (r - 0.90f) * 0.55f;
+    if (g > 0.90f) g = 0.90f + (g - 0.90f) * 0.55f;
+    if (b > 0.90f) b = 0.90f + (b - 0.90f) * 0.55f;
+    float hlift = 0.015f * ss(0.6f, 1.0f, lum3(r, g, b));
+    r = _clampf(r + hlift, 0.0f, 1.0f);
+    g = _clampf(g + hlift, 0.0f, 1.0f);
+    b = _clampf(b + hlift, 0.0f, 1.0f);
+
+    // Mix com o original (slider Intensidade)
+    r = r0 + (r - r0) * gMix;
+    g = g0 + (g - g0) * gMix;
+    b = b0 + (b - b0) * gMix;
+
+    return make_float3(r, g, b);
+}

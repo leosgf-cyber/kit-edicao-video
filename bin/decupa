@@ -1,0 +1,4 @@
+#!/bin/zsh
+# decupa: ver README.md. Roda o módulo comandos.decupa com o venv do kit.
+RAIZ="${0:A:h:h}"
+PYTHONPATH="$RAIZ" exec "$RAIZ/venv/bin/python" -m comandos.decupa "$@"

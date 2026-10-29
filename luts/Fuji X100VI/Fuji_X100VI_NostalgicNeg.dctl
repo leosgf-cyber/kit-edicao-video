@@ -1,0 +1,26 @@
+// Sony (Adobe RGB) -> Fuji X100VI Nostalgic Neg (emulacao FORTE)  |  DaVinci Resolve 20 Studio
+// Intensidade: 0=original, 1=look padrao, >1 EXTRAPOLA (mais forte). Max 2.0.
+DEFINE_UI_PARAMS(gMix, Intensidade, DCTLUI_SLIDER_FLOAT, 1.0, 0.0, 2.0, 0.01)
+__DEVICE__ float ss(float a,float b,float x){float t=_clampf((x-a)/(b-a),0.0f,1.0f);return t*t*(3.0f-2.0f*t);}
+__DEVICE__ float lum3(float r,float g,float b){return 0.2126f*r+0.7152f*g+0.0722f*b;}
+__DEVICE__ float3 transform(int p_W,int p_H,int p_X,int p_Y,float p_R,float p_G,float p_B){
+ float r=p_R,g=p_G,b=p_B,r0=p_R,g0=p_G,b0=p_B;
+ r=_clampf(r*1.055000f,0.0f,1.0f);g=_clampf(g*0.988000f,0.0f,1.0f);b=_clampf(b*0.942000f,0.0f,1.0f);
+ r=_clampf(r*(1.045000f-0.038000f)+0.038000f,0.0f,1.0f);g=_clampf(g*(0.990000f-0.032000f)+0.032000f,0.0f,1.0f);b=_clampf(b*(0.905000f-0.034000f)+0.034000f,0.0f,1.0f);
+ r=_powf(r,1.0f/0.960000f);g=_powf(g,1.0f/0.988000f);b=_powf(b,1.0f/1.036000f);
+ float l=lum3(r,g,b);float sw=1.0f-ss(0.0f,0.500000f,l);float hw=ss(0.500000f,1.0f,l);
+ r=_clampf(r+sw*-0.016000f+hw*0.066000f,0.0f,1.0f);g=_clampf(g+sw*0.008000f+hw*0.038000f,0.0f,1.0f);b=_clampf(b+sw*0.036000f+hw*-0.066000f,0.0f,1.0f);
+ float ct=0.160000f;
+ r=_clampf(r+ct*(r-0.5f)*(1.0f-_fabs(r-0.5f)*2.0f),0.0f,1.0f);g=_clampf(g+ct*(g-0.5f)*(1.0f-_fabs(g-0.5f)*2.0f),0.0f,1.0f);b=_clampf(b+ct*(b-0.5f)*(1.0f-_fabs(b-0.5f)*2.0f),0.0f,1.0f);
+ l=lum3(r,g,b);
+ float rm=ss(0.10f,0.45f,r-_fmaxf(g,b));float gm=ss(0.08f,0.40f,g-_fmaxf(r,b));float bm=ss(0.10f,0.45f,b-_fmaxf(r,g));
+ float gg=0.880000f;
+ r=l+(r-l)*gg*(1.0f+-0.060000f*rm);g=l+(g-l)*gg*(1.0f+-0.160000f*gm);b=l+(b-l)*gg*(1.0f+-0.240000f*bm);
+ r=r+gm*0.014000f;g=g+rm*0.014000f;
+ r=_clampf(r,0.0f,1.0f);g=_clampf(g,0.0f,1.0f);b=_clampf(b,0.0f,1.0f);
+ float k=0.800000f,so=0.480000f;
+ if(r>k)r=k+(r-k)*so; if(g>k)g=k+(g-k)*so; if(b>k)b=k+(b-k)*so;
+ float m=0.030000f;
+ r=_clampf(m+r*(1.0f-m),0.0f,1.0f);g=_clampf(m+g*(1.0f-m),0.0f,1.0f);b=_clampf(m+b*(1.0f-m),0.0f,1.0f);
+ r=r0+(r-r0)*gMix;g=g0+(g-g0)*gMix;b=b0+(b-b0)*gMix;
+ return make_float3(_clampf(r,0.0f,1.0f),_clampf(g,0.0f,1.0f),_clampf(b,0.0f,1.0f));}

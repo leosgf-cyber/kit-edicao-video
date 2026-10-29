@@ -1,0 +1,8 @@
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.DS_Store
+_folha.jpg
+bin/aroll-pessoas
+comandos/luts/slog3_709.cube

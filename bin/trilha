@@ -1,0 +1,7 @@
+#!/bin/zsh
+# trilha: baixa o áudio de um vídeo (YouTube, Instagram, TikTok...) em MP3, qualidade máxima.
+# Uso: trilha "<url>"
+# Salva em ~/Music/TRILHAS (TRILHAS_DIR muda a pasta). Usa os cookies do Chrome:
+# o YouTube passou a exigir, sem eles dá 403/429 ("confirme que não é um robô").
+exec yt-dlp -x --audio-format mp3 --audio-quality 0 --no-playlist --cookies-from-browser chrome \
+  -o "${TRILHAS_DIR:-$HOME/Music/TRILHAS}/%(title)s.%(ext)s" "$@"
